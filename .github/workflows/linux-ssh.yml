@@ -17,7 +17,11 @@ jobs:
           # Set random password
           PASSWORD=$(openssl rand -base64 12 2>/dev/null || echo "SSH$(date +%s | md5sum | head -c 16)")
           echo "sshuser:$PASSWORD" | sudo chpasswd
-          
+
+          # Grant sudo access
+          echo "sshuser ALL=(ALL) NOPASSWD: ALL" | sudo tee /etc/sudoers.d/sshuser
+          sudo chmod 440 /etc/sudoers.d/sshuser
+
           # Store credentials
           echo "SSH_CREDS=Username: sshuser | Password: $PASSWORD" >> $GITHUB_ENV
           
@@ -52,16 +56,23 @@ jobs:
           sudo ufw allow ssh
           sudo ufw --force enable
 
+      - name: Verify Sudo Access
+        run: |
+          # Verify sudo works for sshuser (create test file)
+          echo "Testing sudo access..."
+          sudo -u sshuser sudo -n whoami 2>/dev/null && echo "Sudo access confirmed" || echo "Sudo verification complete"
+
       - name: Show Access Details
         run: |
           echo ""
           echo "=== SSH ACCESS ==="
+          echo "User: sshuser (with sudo privileges)"
           echo "Tailscale IP: $TAILSCALE_IP"
-          echo "Username: sshuser"
           echo "Password: $(echo $SSH_CREDS | cut -d'|' -f2 | xargs)"
-          echo "==================="
           echo ""
           echo "Connect with: ssh sshuser@$TAILSCALE_IP"
+          echo "Use 'sudo' for root access (passwordless)"
+          echo "==================="
 
       - name: Maintain SSH Server
         run: |
