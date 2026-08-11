@@ -1,0 +1,80 @@
+name: Linux SSH Server
+
+on:
+  workflow_dispatch:
+
+jobs:
+  ssh-server:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3600
+
+    steps:
+      - name: Set up SSH
+        run: |
+          # Create SSH user
+          sudo useradd -m -s /bin/bash sshuser
+          
+          # Set random password
+          PASSWORD=$(openssl rand -base64 12 2>/dev/null || echo "SSH$(date +%s | md5sum | head -c 16)")
+          echo "sshuser:$PASSWORD" | sudo chpasswd
+          
+          # Store credentials
+          echo "SSH_CREDS=Username: sshuser | Password: $PASSWORD" >> $GITHUB_ENV
+          
+          # Enable SSH service
+          sudo service ssh start
+          sudo service ssh status || (sudo apt-get update && sudo apt-get install -y openssh-server && sudo service ssh start)
+
+      - name: Configure SSH Security
+        run: |
+          # Backup and modify SSH config to allow password auth (for demo)
+          sudo cp /etc/ssh/sshd_config /etc/ssh/sshd_config.bak
+          sudo sed -i 's/#PasswordAuthentication yes/PasswordAuthentication yes/' /etc/ssh/sshd_config
+          sudo sed -i 's/PasswordAuthentication no/PasswordAuthentication yes/' /etc/ssh/sshd_config
+          sudo service ssh restart
+
+      - name: Install Tailscale
+        run: |
+          # Install Tailscale
+          curl -fsSL https://tailscale.com/install.sh | sh
+          sudo tailscale up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-ssh-runner-$GITHUB_RUN_ID
+          sudo tailscale status
+
+      - name: Get Tailscale IP
+        run: |
+          sleep 5
+          TS_IP=$(tailscale ip -4)
+          echo "TAILSCALE_IP=$TS_IP" >> $GITHUB_ENV
+
+      - name: Configure Firewall
+        run: |
+          # Allow SSH on Tailscale interface
+          sudo ufw allow ssh
+          sudo ufw --force enable
+
+      - name: Show Access Details
+        run: |
+          echo ""
+          echo "=== SSH ACCESS ==="
+          echo "Tailscale IP: $TAILSCALE_IP"
+          echo "Username: sshuser"
+          echo "Password: $(echo $SSH_CREDS | cut -d'|' -f2 | xargs)"
+          echo "==================="
+          echo ""
+          echo "Connect with: ssh sshuser@$TAILSCALE_IP"
+
+      - name: Maintain SSH Server
+        run: |
+          echo ""
+          echo "=== SSH SERVER ACTIVE ==="
+          echo "Tailscale IP: $TAILSCALE_IP"
+          echo "Connect: ssh sshuser@$TAILSCALE_IP"
+          echo "========================="
+          echo ""
+          
+          # Keep the workflow alive
+          while true; do
+              echo "[$(date)] SSH Server running - Tailscale IP: $TAILSCALE_IP"
+              sudo tailscale status
+              sleep 300
+          done
