@@ -115,11 +115,18 @@ jobs:
       - name: Restore persistent volume from B2
         run: |
           echo "Restoring from ${RCLONE_REMOTE}:${BUCKET_NAME}/${PERSIST_PATH} ..."
-          # First-ever run: nothing in B2 yet — tolerate the failure gracefully.
-          sudo rclone --config "$RCLONE_CONF" sync \
-            "${RCLONE_REMOTE}:${BUCKET_NAME}/${PERSIST_PATH}" /mnt/persistent \
-            && echo "✅ Restore complete." \
-            || echo "ℹ️  No remote data found (first run or empty bucket) — starting fresh."
+          # `copy` (lenient) instead of `sync`: on a first-ever run the remote
+          # prefix does not exist yet, and `copy` treats an empty/missing remote
+          # source as a silent no-op instead of erroring with 'directory not found'.
+          # rclone output is captured to a log (kept out of the job log for clarity);
+          # the real success signal is whether last-state.env came down.
+          sudo rclone --config "$RCLONE_CONF" copy \
+            "${RCLONE_REMOTE}:${BUCKET_NAME}/${PERSIST_PATH}" /mnt/persistent >/tmp/restore.log 2>&1 || true
+          if [ -f /mnt/persistent/last-state.env ]; then
+            echo "✅ Restore complete (recovered prior run state from B2)."
+          else
+            echo "ℹ️  No remote data found (first run or empty bucket) — starting fresh."
+          fi
 
       # =====================================================================
       # STEP 5 — Create SSH user (FRESH random password each run — by design)
@@ -237,20 +244,53 @@ jobs:
           while [ "$(date +%s)" -lt "$END_TS" ]; do
             UPTIME=$(( $(date +%s) - START_TS ))
 
-            # Pull live sshuser data back into the persistent volume (root: reads sshuser's home)
-            sudo rsync -a --delete /home/sshuser/ /mnt/persistent/home/sshuser/ 2>/dev/null || true
-            sudo rsync -a --delete /opt/data/ /mnt/persistent/data/ 2>/dev/null || true
-            sudo rsync -a --delete /opt/scripts/ /mnt/persistent/scripts/ 2>/dev/null || true
+            # Guarantee the persistent subtrees exist BEFORE rsync/rclone so a
+            # missing local source can never trigger 'directory not found'
+            # (fresh volume, before rsync has populated /mnt/persistent/{home,data,scripts}).
+            sudo mkdir -p /mnt/persistent/home/sshuser /mnt/persistent/data /mnt/persistent/scripts \
+              || echo "  ⚠️  could not pre-create /mnt/persistent subtrees"
 
-            # Persist data dirs to B2 every 60s (root reads /tmp/rclone.conf)
-            sudo rclone --config "$RCLONE_CONF" sync /mnt/persistent/home   "${RCLONE_REMOTE}:${BUCKET_NAME}/${PERSIST_PATH}/home"   2>&1 | tail -1 || true
-            sudo rclone --config "$RCLONE_CONF" sync /mnt/persistent/data   "${RCLONE_REMOTE}:${BUCKET_NAME}/${PERSIST_PATH}/data"   2>&1 | tail -1 || true
-            sudo rclone --config "$RCLONE_CONF" sync /mnt/persistent/scripts "${RCLONE_REMOTE}:${BUCKET_NAME}/${PERSIST_PATH}/scripts" 2>&1 | tail -1 || true
+            # Pull live sshuser data back into the persistent volume (root reads sshuser's home)
+            if sudo rsync -a --delete /home/sshuser/ /mnt/persistent/home/sshuser/ >/tmp/rsync_home.log 2>&1; then
+              echo "  [snapshot] /home/sshuser -> /mnt/persistent OK"
+            else
+              echo "  [snapshot] ⚠️  /home/sshuser rsync: $(tail -1 /tmp/rsync_home.log 2>/dev/null)"
+            fi
+            if sudo rsync -a --delete /opt/data/ /mnt/persistent/data/ >/tmp/rsync_data.log 2>&1; then
+              echo "  [snapshot] /opt/data -> /mnt/persistent OK"
+            else
+              echo "  [snapshot] ⚠️  /opt/data rsync: $(tail -1 /tmp/rsync_data.log 2>/dev/null)"
+            fi
+            if sudo rsync -a --delete /opt/scripts/ /mnt/persistent/scripts/ >/tmp/rsync_scripts.log 2>&1; then
+              echo "  [snapshot] /opt/scripts -> /mnt/persistent OK"
+            else
+              echo "  [snapshot] ⚠️  /opt/scripts rsync: $(tail -1 /tmp/rsync_scripts.log 2>/dev/null)"
+            fi
 
-            # Rewrite last-state.env to B2 each iteration — NEWEST run wins
-            # (handles the ~10-min handoff overlap cleanly)
-            sudo rclone --config "$RCLONE_CONF" copyto /mnt/persistent/last-state.env \
-              "${RCLONE_REMOTE}:${BUCKET_NAME}/${PERSIST_PATH}/last-state.env" 2>&1 | tail -1 || true
+            # Persist data dirs to B2 every 60s (each guarded; a missing dir is
+            # skipped, never a fatal 'directory not found').
+            for SUB in home data scripts; do
+              if [ -d "/mnt/persistent/$SUB" ]; then
+                if sudo rclone --config "$RCLONE_CONF" sync "/mnt/persistent/$SUB" "${RCLONE_REMOTE}:${BUCKET_NAME}/${PERSIST_PATH}/${SUB}" >/tmp/rclone-$SUB.log 2>&1; then
+                  echo "  [b2] sync/$SUB persisted OK"
+                else
+                  echo "  [b2] ⚠️  sync/$SUB failed: $(tail -2 /tmp/rclone-$SUB.log 2>/dev/null)"
+                fi
+              else
+                echo "  [b2] (skip $SUB — /mnt/persistent/$SUB absent)"
+              fi
+            done
+
+            # Persist the credentials file (critical path) — guard existence + report
+            if [ -f /mnt/persistent/last-state.env ]; then
+              if sudo rclone --config "$RCLONE_CONF" copyto /mnt/persistent/last-state.env "${RCLONE_REMOTE}:${BUCKET_NAME}/${PERSIST_PATH}/last-state.env" >/tmp/rclone-state.log 2>&1; then
+                echo "  [b2] last-state.env persisted OK"
+              else
+                echo "  [b2] ⚠️  copyto last-state.env FAILED: $(tail -3 /tmp/rclone-state.log 2>/dev/null)"
+              fi
+            else
+              echo "  [b2] ⚠️  last-state.env MISSING on runner — credentials NOT persisted to B2!"
+            fi
 
             echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] SSH Server running — uptime ${UPTIME}s. State synced to B2."
             sudo tailscale status 2>/dev/null | head -3 || true
@@ -277,9 +317,16 @@ jobs:
         if: always()
         run: |
           echo "Final state flush to b2://${BUCKET_NAME}/${PERSIST_PATH} ..."
+          # Pre-create subtrees so rsync into them never fails on a fresh volume
+          sudo mkdir -p /mnt/persistent/home/sshuser /mnt/persistent/data /mnt/persistent/scripts || true
           sudo rsync -a /home/sshuser/ /mnt/persistent/home/sshuser/ 2>/dev/null || true
           sudo rsync -a /opt/data/ /mnt/persistent/data/ 2>/dev/null || true
           sudo rsync -a /opt/scripts/ /mnt/persistent/scripts/ 2>/dev/null || true
-          sudo rclone --config "$RCLONE_CONF" sync /mnt/persistent \
-            "${RCLONE_REMOTE}:${BUCKET_NAME}/${PERSIST_PATH}" 2>&1 || true
-          echo "✅ Final flush complete. State preserved for the next run."
+          # Top-level copy of all persistent state (incl. last-state.env) to B2.
+          # `copy` (lenient) is preferred over `sync` here: best-effort, never
+          # deletes remote objects on the one-shot final flush.
+          if sudo rclone --config "$RCLONE_CONF" copy /mnt/persistent "${RCLONE_REMOTE}:${BUCKET_NAME}/${PERSIST_PATH}" >/tmp/finalflush.log 2>&1; then
+            echo "✅ Final flush complete. State preserved for the next run."
+          else
+            echo "⚠️  Final B2 flush failed: $(tail -3 /tmp/finalflush.log 2>/dev/null)"
+          fi
