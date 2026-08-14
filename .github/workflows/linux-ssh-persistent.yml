@@ -8,48 +8,50 @@
 #   run at T=350 minutes (just before the 6-hour GitHub Actions hard cap) so the
 #   SSH endpoint is self-healing.
 #
-#   Each run gets a NEW Tailscale IP + NEW random SSH password (by design).
+#   Each run gets a NEW Tailscale IP + NEW random SSH password (accepted by design).
 #   Current credentials are discoverable two ways:
 #     1. GitHub Actions run log → "Show Access Details" step
-#     2. Backblaze B2 → <bucket>/ssh-persist/last-state.env
+#     2. Backblaze B2 → <bucket>/ssh-persist/last-state.env  (use ssh-discover-creds.sh)
 #
 # Required GitHub Secrets:
 #   TAILSCALE_AUTH_KEY  (existing)  — Tailscale node join key
 #   B2_KEY_ID           (new)       — Backblaze key ID  (from Documents/backblaze.txt)
-#   B2_APP_KEY          (new)       — Backblaze application key
-#   RESTART_TOKEN       (new)       — PAT with `workflow` scope (for self-restart API call)
+#   B2_APP_KEY          (new)       — Backblaze application key (the long secret)
+#   RESTART_TOKEN       (new)       — PAT with `workflow` scope (self-restart API call)
 #
-# Required GitHub Secret values must be set INTERACTIVELY by you:
-#   gh secret set B2_KEY_ID ...
-#   gh secret set B2_APP_KEY ...
-#   gh secret set RESTART_TOKEN ...
+# NOTE on rclone config: credentials are written to /tmp/rclone.conf (chmod 600)
+#   at the start of the run. This is an EPHEMERAL GitHub runner VM — /tmp is
+#   destroyed when the 6h run ends. No secrets are committed to the repo or
+#   written to any persistent file. This pattern is used instead of env vars
+#   to avoid sudo env-stripping when root (sudo) is needed for rclone/rsync.
 # =============================================================================
 
 name: Linux SSH Server (Persistent Volume)
 
 on:
-  workflow_dispatch:    # manual trigger + self-restart (via PAT API)
+  workflow_dispatch:    # manual trigger + self-restart (via PAT API at T=350m)
 
 jobs:
   ssh-server:
     runs-on: ubuntu-latest
     timeout-minutes: 360         # 6h hard cap — GitHub Actions enforced maximum
     permissions:
-      contents: read             # minimal; needed to checkout nothing, really
+      contents: read             # minimal scope
     env:
       # Backblaze B2 configuration (bucket + path — NOT secrets)
       BUCKET_NAME: "mygitbucket"
       PERSIST_PATH: "ssh-persist"   # top-level "folder" inside the bucket
       # Self-restart: wait 350 min (21,000s) before handing off to the next run.
-      # This is ~10 min before the 6h (360 min) hard cap, leaving a safe buffer
-      # for the new runner to boot + register its Tailscale node.
+      # ~10 min buffer before the 6h (360 min) hard cap, for the new runner to
+      # boot + register its Tailscale node.
       AUTO_RESTART_AT_SECONDS: 21000
-      # rclone remote name (configured purely via env vars below — no config file)
+      # rclone remote name (defined in /tmp/rclone.conf, not env vars)
       RCLONE_REMOTE: "b2persistent"
+      RCLONE_CONF: "/tmp/rclone.conf"
 
     steps:
       # =====================================================================
-      # STEP 1 — Install rclone (sync tool for Backblaze B2)
+      # STEP 1 — Install rclone + rsync
       # =====================================================================
       - name: Install rsync and rclone
         run: |
@@ -57,33 +59,70 @@ jobs:
           sudo apt-get install -y -qq rclone rsync
 
       # =====================================================================
-      # STEP 2 — RESTORE the persistent volume from Backblaze B2
-      #
-      # rclone is configured NON-interactively via environment variables:
-      #   RCLONE_CONFIG_<REMOTE>_<KEY>=value
-      # No config file is written to disk; secrets live only in memory.
+      # STEP 2 — Build a TEMPORARY rclone config from secrets (chmod 600)
+      #   /tmp is destroyed when the runner VM dies (6h). No secrets are
+      #   committed to the repo or persisted beyond this ephemeral run.
       # =====================================================================
-      - name: Restore persistent volume from B2
+      - name: Write temporary rclone config
         env:
           B2_KEY_ID: ${{ secrets.B2_KEY_ID }}
           B2_APP_KEY: ${{ secrets.B2_APP_KEY }}
         run: |
           sudo mkdir -p /mnt/persistent
-          sudo chown -R 1000:1000 /mnt/persistent
-
-          # Configure rclone B2 remote entirely via env vars (no file on disk)
-          export RCLONE_CONFIG_${RCLONE_REMOTE^^}_TYPE=b2
-          export RCLONE_CONFIG_${RCLONE_REMOTE^^}_ACCOUNT="$B2_KEY_ID"
-          export RCLONE_CONFIG_${RCLONE_REMOTE^^}_KEY="$B2_APP_KEY"
-
-          echo "Restoring volume from b2://${BUCKET_NAME}/${PERSIST_PATH} ..."
-          # First-ever run: nothing in B2 yet — tolerate the failure.
-          rclone sync "${RCLONE_REMOTE}:${BUCKET_NAME}/${PERSIST_PATH}" /mnt/persistent \
-            && echo "Restore complete." \
-            || echo "No remote data found (first run or empty bucket) — starting fresh."
+          # Write rclone config with secrets — only readable by root (chmod 600)
+          sudo tee "$RCLONE_CONF" > /dev/null <<EOF
+          [b2persistent]
+          type = b2
+          account = $B2_KEY_ID
+          key = $B2_APP_KEY
+          EOF
+          sudo chmod 600 "$RCLONE_CONF"
+          echo "rclone config written to $RCLONE_CONF (chmod 600, ephemeral)."
 
       # =====================================================================
-      # STEP 3 — Create SSH user with a FRESH random password each run
+      # STEP 3 — Verify B2 connectivity (DIAGNOSTIC — never fails the job)
+      # =====================================================================
+      - name: Verify Backblaze B2 connectivity
+        # continue-on-error so a B2 auth failure is DIAGNOSED, not fatal:
+        # the SSH server still runs this cycle; fix creds for the next run.
+        continue-on-error: true
+        run: |
+          echo "Testing rclone B2 auth + bucket access..."
+          # `lsd b2persistent:` lists ALL buckets for the authed account.
+          # Exit 0 = auth works. A 401 in the log = invalid B2 credentials.
+          set +e
+          sudo rclone --config "$RCLONE_CONF" lsd "${RCLONE_REMOTE}:" >/tmp/b2lsd.log 2>&1
+          LSDEXIT=$?
+          cat /tmp/b2lsd.log
+          echo "rclone lsd exit code: $LSDEXIT"
+          if [ $LSDEXIT -eq 0 ]; then
+            if grep -q "$BUCKET_NAME" /tmp/b2lsd.log 2>/dev/null; then
+              echo "✅ B2 AUTH OK — account authenticated; bucket '${BUCKET_NAME}' visible."
+            else
+              echo "✅ B2 AUTH OK — account authenticated (bucket '${BUCKET_NAME}' not found yet — will be created on first persist)."
+            fi
+          else
+            echo "⚠️  B2 AUTH FAILED — exit code $LSDEXIT."
+            echo "   Cause: B2_KEY_ID / B2_APP_KEY secrets are invalid, empty, or not set."
+            echo "   Action: re-run 'gh secret set B2_KEY_ID' and 'gh secret set B2_APP_KEY'."
+            echo "           (values from /home/vznx777/Documents/backblaze.txt)"
+          fi
+          echo "rclone version: $(sudo rclone version --config "$RCLONE_CONF" 2>&1 | head -1)"
+
+      # =====================================================================
+      # STEP 4 — RESTORE the persistent volume from Backblaze B2
+      # =====================================================================
+      - name: Restore persistent volume from B2
+        run: |
+          echo "Restoring from ${RCLONE_REMOTE}:${BUCKET_NAME}/${PERSIST_PATH} ..."
+          # First-ever run: nothing in B2 yet — tolerate the failure gracefully.
+          sudo rclone --config "$RCLONE_CONF" sync \
+            "${RCLONE_REMOTE}:${BUCKET_NAME}/${PERSIST_PATH}" /mnt/persistent \
+            && echo "✅ Restore complete." \
+            || echo "ℹ️  No remote data found (first run or empty bucket) — starting fresh."
+
+      # =====================================================================
+      # STEP 5 — Create SSH user (FRESH random password each run — by design)
       # =====================================================================
       - name: Set up SSH user
         run: |
@@ -91,8 +130,8 @@ jobs:
           PASSWORD=$(openssl rand -base64 12 2>/dev/null)
           echo "sshuser:$PASSWORD" | sudo chpasswd
 
-          # Grant full passwordless sudo to sshuser
-          echo "sshuser ALL=(ALL) NOPASSWD: ALL" | sudo tee /etc/sudoers.d/sshuser
+          # Grant full passwordless sudo
+          echo "sshuser ALL=(ALL) NOPASSWD: ALL" | sudo tee /etc/sudoers.d/sshuser > /dev/null
           sudo chmod 440 /etc/sudoers.d/sshuser
 
           # Install + start openssh-server
@@ -100,18 +139,18 @@ jobs:
           sudo service ssh start
 
           # Persist credentials into last-state.env (OVERWRITE — fresh each run)
-          # This file is the source of truth for "how to connect to the current run."
-          cat > /mnt/persistent/last-state.env <<EOF
+          # Source of truth for "how to connect to the current run."
+          sudo tee /mnt/persistent/last-state.env > /dev/null <<EOF
           RUN_ID=${GITHUB_RUN_ID}
           TAILSCALE_IP=(pending)
           RUN_PASSWORD=${PASSWORD}
           STARTED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
           STATUS=booting
           EOF
-          echo "SSH user 'sshuser' created with a fresh random password."
+          echo "✅ sshuser created (password is ephemeral per-run; persisted to B2)."
 
       # =====================================================================
-      # STEP 4 — Configure SSH for password auth (matches original workflow)
+      # STEP 6 — Configure SSH for password auth (matches original workflow)
       # =====================================================================
       - name: Configure SSH Security
         run: |
@@ -119,7 +158,7 @@ jobs:
           sudo service ssh restart
 
       # =====================================================================
-      # STEP 5 — Install + join Tailscale (NEW node / IP every run — expected)
+      # STEP 7 — Install + join Tailscale (NEW node/IP every run — expected)
       # =====================================================================
       - name: Install Tailscale
         run: |
@@ -133,15 +172,15 @@ jobs:
           TS_IP=$(tailscale ip -4)
           echo "TAILSCALE_IP=$TS_IP" >> $GITHUB_ENV
 
-          # Fill in the real IP + mark as active in last-state.env
-          cat > /mnt/persistent/last-state.env <<EOF
+          # Rewrite last-state.env with the real IP (preserve password from step 5)
+          sudo tee /mnt/persistent/last-state.env > /dev/null <<EOF
           RUN_ID=${GITHUB_RUN_ID}
           TAILSCALE_IP=${TS_IP}
-          RUN_PASSWORD=$(grep '^RUN_PASSWORD=' /mnt/persistent/last-state.env | cut -d= -f2-)
-          STARTED_AT=$(grep '^STARTED_AT=' /mnt/persistent/last-state.env | head -1 | cut -d= -f2-)
+          RUN_PASSWORD=$(sudo grep '^RUN_PASSWORD=' /mnt/persistent/last-state.env | cut -d= -f2-)
+          STARTED_AT=$(sudo grep '^STARTED_AT=' /mnt/persistent/last-state.env | head -1 | cut -d= -f2-)
           STATUS=active
           EOF
-          echo "Tailscale IP: $TS_IP"
+          echo "✅ Tailscale IP: $TS_IP"
 
       - name: Configure Firewall
         run: |
@@ -149,76 +188,68 @@ jobs:
           sudo ufw --force enable
 
       # =====================================================================
-      # STEP 6 — Attach persisted user data into the live filesystem
+      # STEP 8 — Attach persisted user data into the live filesystem
       # =====================================================================
       - name: Attach persistent data to sshuser workspace
         run: |
           sudo mkdir -p /opt/data /opt/scripts
-          # Restore the user's persistent workspace into the live home dir
           sudo rsync -a /mnt/persistent/home/sshuser/ /home/sshuser/ 2>/dev/null || true
-          sudo rsync -a /mnt/persistent/data/ /opt/data/ 2>/dev/null || true
-          sudo rsync -a /mnt/persistent/scripts/ /opt/scripts/ 2>/dev/null || true
+          sudo rsync -a /mnt/persistent/data/     /opt/data/  2>/dev/null || true
+          sudo rsync -a /mnt/persistent/scripts/  /opt/scripts/ 2>/dev/null || true
           sudo chown -R sshuser:sshuser /home/sshuser /opt/data /opt/scripts
 
       - name: Verify Sudo Access
         run: sudo -u sshuser sudo -n whoami
 
       # =====================================================================
-      # STEP 7 — Show access details (current run credentials)
+      # STEP 9 — Show access details (current run credentials)
       # =====================================================================
       - name: Show Access Details
         run: |
+          PASS=$(sudo grep '^RUN_PASSWORD=' /mnt/persistent/last-state.env | cut -d= -f2-)
+          STARTED=$(sudo grep '^STARTED_AT=' /mnt/persistent/last-state.env | cut -d= -f2-)
           echo ""
           echo "================================= SSH ACCESS (current run) ================================"
           echo "  Connection:  ssh sshuser@${TAILSCALE_IP}"
-          echo "  Password:    $(grep '^RUN_PASSWORD=' /mnt/persistent/last-state.env | cut -d= -f2-)"
+          echo "  Password:    ${PASS}"
           echo "  Run ID:      ${GITHUB_RUN_ID}"
-          echo "  Started:     $(grep '^STARTED_AT=' /mnt/persistent/last-state.env | cut -d= -f2-)"
-          echo "  (credentials also persisted to B2: ${BUCKET_NAME}/${PERSIST_PATH}/last-state.env)"
-          echo "  (NEW IP + password each 6h run by design; read last-state.env for current)."
+          echo "  Started:     ${STARTED}"
+          echo "  (also persisted to B2: ${BUCKET_NAME}/${PERSIST_PATH}/last-state.env)"
+          echo "  (NEW IP + password each 6h run by design.)"
           echo "=========================================================================================="
           echo ""
 
       # =====================================================================
-      # STEP 8 — Maintain server + persist state in a loop
+      # STEP 10 — Maintain server + persist state in a loop
       #
-      # This loop runs for AUTO_RESTART_AT_SECONDS (350 min), syncing the
-      # persistent volume to B2 every 60 seconds. At T=350m it triggers a NEW
-      # run of this workflow via the GitHub API (using RESTART_TOKEN PAT), then
-      # exits — well before the 6h hard timeout kills the VM.
+      # Runs for AUTO_RESTART_AT_SECONDS (350 min), syncing the persistent
+      # volume to B2 every 60s. At T=350m it dispatches a NEW run via the
+      # GitHub API (RESTART_TOKEN PAT), then exits — before the 6h hard cap.
       # =====================================================================
       - name: Maintain SSH Server (self-restart at T=350m)
         env:
-          B2_KEY_ID: ${{ secrets.B2_KEY_ID }}
-          B2_APP_KEY: ${{ secrets.B2_APP_KEY }}
           RESTART_TOKEN: ${{ secrets.RESTART_TOKEN }}
         run: |
-          # Configure rclone remote via env vars (same pattern as restore step)
-          export RCLONE_CONFIG_${RCLONE_REMOTE^^}_TYPE=b2
-          export RCLONE_CONFIG_${RCLONE_REMOTE^^}_ACCOUNT="$B2_KEY_ID"
-          export RCLONE_CONFIG_${RCLONE_REMOTE^^}_KEY="$B2_APP_KEY"
-
           START_TS=$(date +%s)
           END_TS=$(( START_TS + AUTO_RESTART_AT_SECONDS ))
-
           echo "Maintaining SSH server. Auto-restart at T=+${AUTO_RESTART_AT_SECONDS}s (350 min)."
 
           while [ "$(date +%s)" -lt "$END_TS" ]; do
             UPTIME=$(( $(date +%s) - START_TS ))
 
-            # Pull live sshuser sessions/data back into the persistent volume
+            # Pull live sshuser data back into the persistent volume (root: reads sshuser's home)
             sudo rsync -a --delete /home/sshuser/ /mnt/persistent/home/sshuser/ 2>/dev/null || true
             sudo rsync -a --delete /opt/data/ /mnt/persistent/data/ 2>/dev/null || true
             sudo rsync -a --delete /opt/scripts/ /mnt/persistent/scripts/ 2>/dev/null || true
 
-            # Persist data dirs to B2 (last-state.env is written separately to avoid races)
-            rclone sync /mnt/persistent/home "${RCLONE_REMOTE}:${BUCKET_NAME}/${PERSIST_PATH}/home" 2>&1 | tail -1 || true
-            rclone sync /mnt/persistent/data "${RCLONE_REMOTE}:${BUCKET_NAME}/${PERSIST_PATH}/data" 2>&1 | tail -1 || true
-            rclone sync /mnt/persistent/scripts "${RCLONE_REMOTE}:${BUCKET_NAME}/${PERSIST_PATH}/scripts" 2>&1 | tail -1 || true
+            # Persist data dirs to B2 every 60s (root reads /tmp/rclone.conf)
+            sudo rclone --config "$RCLONE_CONF" sync /mnt/persistent/home   "${RCLONE_REMOTE}:${BUCKET_NAME}/${PERSIST_PATH}/home"   2>&1 | tail -1 || true
+            sudo rclone --config "$RCLONE_CONF" sync /mnt/persistent/data   "${RCLONE_REMOTE}:${BUCKET_NAME}/${PERSIST_PATH}/data"   2>&1 | tail -1 || true
+            sudo rclone --config "$RCLONE_CONF" sync /mnt/persistent/scripts "${RCLONE_REMOTE}:${BUCKET_NAME}/${PERSIST_PATH}/scripts" 2>&1 | tail -1 || true
 
-            # Rewrite last-state.env to B2 each iteration so the NEWEST run
-            # always wins (handles the handoff overlap window cleanly)
-            rclone copyto /mnt/persistent/last-state.env \
+            # Rewrite last-state.env to B2 each iteration — NEWEST run wins
+            # (handles the ~10-min handoff overlap cleanly)
+            sudo rclone --config "$RCLONE_CONF" copyto /mnt/persistent/last-state.env \
               "${RCLONE_REMOTE}:${BUCKET_NAME}/${PERSIST_PATH}/last-state.env" 2>&1 | tail -1 || true
 
             echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] SSH Server running — uptime ${UPTIME}s. State synced to B2."
@@ -234,25 +265,21 @@ jobs:
             "https://api.github.com/repos/${{ github.repository }}/actions/workflows/linux-ssh-persistent.yml/dispatches" \
             -d '{"ref":"main"}' || echo "000")
           echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] Next-run dispatch HTTP status: $HTTP_CODE"
+          if [ "$HTTP_CODE" != "204" ]; then
+            echo "⚠️  Dispatch did not return 204 — check RESTART_TOKEN permissions."
+          fi
           echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] Shutting down this runner. A fresh run should be starting now."
 
       # =====================================================================
-      # STEP 9 — Final persist to B2 (runs on ANY exit: normal/success/timeout/cancel)
+      # STEP 11 — Final persist to B2 (runs on ANY exit: success/timeout/cancel)
       # =====================================================================
       - name: Persist state to B2 (final flush, always)
         if: always()
-        env:
-          B2_KEY_ID: ${{ secrets.B2_KEY_ID }}
-          B2_APP_KEY: ${{ secrets.B2_APP_KEY }}
         run: |
-          export RCLONE_CONFIG_${RCLONE_REMOTE^^}_TYPE=b2
-          export RCLONE_CONFIG_${RCLONE_REMOTE^^}_ACCOUNT="$B2_KEY_ID"
-          export RCLONE_CONFIG_${RCLONE_REMOTE^^}_KEY="$B2_APP_KEY"
-
           echo "Final state flush to b2://${BUCKET_NAME}/${PERSIST_PATH} ..."
           sudo rsync -a /home/sshuser/ /mnt/persistent/home/sshuser/ 2>/dev/null || true
           sudo rsync -a /opt/data/ /mnt/persistent/data/ 2>/dev/null || true
           sudo rsync -a /opt/scripts/ /mnt/persistent/scripts/ 2>/dev/null || true
-
-          rclone sync /mnt/persistent "${RCLONE_REMOTE}:${BUCKET_NAME}/${PERSIST_PATH}" 2>&1 || true
-          echo "Final flush complete. State preserved for the next run."
+          sudo rclone --config "$RCLONE_CONF" sync /mnt/persistent \
+            "${RCLONE_REMOTE}:${BUCKET_NAME}/${PERSIST_PATH}" 2>&1 || true
+          echo "✅ Final flush complete. State preserved for the next run."
