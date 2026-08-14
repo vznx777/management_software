@@ -230,7 +230,9 @@ jobs:
       # STEP 10 — Maintain server + persist state in a loop
       #
       # Runs for AUTO_RESTART_AT_SECONDS (350 min), syncing the persistent
-      # volume to B2 every 60s. At T=350m it dispatches a NEW run via the
+      # volume to B2 every 300s (5 min) — see Class-C budget note in §3 of the
+      # runbook (60s cadence burns ~1400 Class C/run, exhausting B2's free 2500/day).
+      # At T=350m it dispatches a NEW run via the
       # GitHub API (RESTART_TOKEN PAT), then exits — before the 6h hard cap.
       # =====================================================================
       - name: Maintain SSH Server (self-restart at T=350m)
@@ -267,7 +269,7 @@ jobs:
               echo "  [snapshot] ⚠️  /opt/scripts rsync: $(tail -1 /tmp/rsync_scripts.log 2>/dev/null)"
             fi
 
-            # Persist data dirs to B2 every 60s (each guarded; a missing dir is
+            # Persist data dirs to B2 every 300s (5 min) (each guarded; a missing dir is
             # skipped, never a fatal 'directory not found').
             for SUB in home data scripts; do
               if [ -d "/mnt/persistent/$SUB" ]; then
@@ -294,7 +296,7 @@ jobs:
 
             echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] SSH Server running — uptime ${UPTIME}s. State synced to B2."
             sudo tailscale status 2>/dev/null | head -3 || true
-            sleep 60
+            sleep 300
           done
 
           # ── Self-restart: dispatch the next fresh run ──────────────
